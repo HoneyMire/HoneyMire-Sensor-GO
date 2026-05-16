@@ -23,6 +23,34 @@ export HONEYMIRE_TOKEN=hop_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 The compose setup exposes Telnet, SSH, HTTP/HTTPS dashboard support, and the
 local dashboard port. See `docker-compose.yml` for the full environment surface.
 
+## Run The Published Image
+
+```sh
+docker run -d \
+  --name honeymire-sensor-go \
+  --restart unless-stopped \
+  -e HONEYMIRE_HUB_URL=https://hub.example/api/v1/ingest \
+  -e HONEYMIRE_TOKEN=hop_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx \
+  -e HONEYMIRE_DEVICE_ID=hp-vps-1 \
+  -e HONEYMIRE_BOARD=docker-edge \
+  -e HONEYMIRE_DISPLAY=none \
+  -e HONEYMIRE_TELNET_LISTEN=:23 \
+  -e HONEYMIRE_SSH_LISTEN=:22 \
+  -e HONEYMIRE_DASHBOARD=:8080 \
+  -e HONEYMIRE_DASHBOARD_AUTH=change-this-dashboard-token \
+  -e HONEYMIRE_IP_COOLDOWN=3m \
+  -e HONEYMIRE_LOGIN_ATTEMPTS_BEFORE_ACCEPT=3 \
+  -p 23:23 \
+  -p 22:22 \
+  -p 8080:8080 \
+  -v honeymire_sensor_state:/data \
+  ghcr.io/honeymire/honeymire-sensor-go:latest
+```
+
+For HTTPS dashboard support with Let's Encrypt, also publish ports 80 and 443
+and set `HONEYMIRE_DASHBOARD_URL` or `DASHBOARD_URL` to a DNS name pointing at
+the host.
+
 ## Published Image
 
 Images are published to GitHub Container Registry:
