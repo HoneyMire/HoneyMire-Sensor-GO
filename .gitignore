@@ -1,0 +1,27 @@
+# Local agent/editor state
+.claude/
+.vscode/
+.idea/
+
+# Secrets and deployment-local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+ssh_host_key
+ssh_host_key.pub
+certs/
+data/
+
+# Build artifacts
+honeypot/honeypot
+*.test
+coverage.out
+dist/
+build/
+
+# Logs and OS files
+*.log
+.DS_Store
