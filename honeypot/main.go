@@ -24,6 +24,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -104,6 +105,28 @@ type Attack struct {
 	Geo            *Geo            `json:"geo,omitempty"`
 	Classification *Classification `json:"classification,omitempty"`
 	ReportedTo     []string        `json:"reported_to,omitempty"`
+	// Hub protocol §3.4.8..§3.4.11. Optional; zero/nil omits the field
+	// and the hub treats it as "not measured" on its end.
+	Bytes        *Bytes       `json:"bytes,omitempty"`
+	Fingerprint  *Fingerprint `json:"fingerprint,omitempty"`
+	Timing       *Timing      `json:"timing,omitempty"`
+	ConnectCount uint64       `json:"connect_count,omitempty"`
+	CVERefs      []string     `json:"cve_refs,omitempty"`
+}
+
+type Bytes struct {
+	RX uint64 `json:"rx,omitempty"`
+	TX uint64 `json:"tx,omitempty"`
+}
+
+type Fingerprint struct {
+	ClientBanner string `json:"client_banner,omitempty"`
+	HASSH        string `json:"hassh,omitempty"`
+	JA3          string `json:"ja3,omitempty"`
+}
+
+type Timing struct {
+	ResponseMSAvg uint64 `json:"response_ms_avg,omitempty"`
 }
 
 type Source struct {
@@ -238,6 +261,11 @@ type appState struct {
 	recent        []recentAttack
 	cooldownMu    sync.Mutex
 	cooldownUntil map[string]time.Time
+	// Per-IP pre-session probe counter (hub protocol §3.4 connect_count):
+	// incremented on every cooldown-rejected accept, drained on session
+	// finalize. The map is bounded by markCooldown's own pruning — entries
+	// only exist while a cooldown is live.
+	probeCounts map[string]uint64
 	stats         stats
 }
 
@@ -272,6 +300,21 @@ type recorder struct {
 	events    []Event
 	total     uint64
 	truncated bool
+	// Hub protocol §3.4.8/§3.4.10 — per-direction byte counts and a
+	// running response-time average measured between every "i" event
+	// and the next "o" event (the firmware-side "response_ms_avg").
+	bytesIn       uint64
+	bytesOut      uint64
+	lastInputAt   time.Time
+	responseSumMS uint64
+	responsePairs uint64
+	// Set by the protocol handler once it knows them. Hub protocol §3.4.9.
+	// `clientBanner` is the SSH "SSH-2.0-<impl>" string from the peer;
+	// telnet has no banner here. `connectCount` is the number of
+	// pre-session TCP probes from this source IP since the last session,
+	// consumed from appState.consumeProbes() right before report.
+	clientBanner string
+	connectCount uint64
 }
 
 type telnetPersona string
@@ -1804,6 +1847,26 @@ func (r *recorder) add(kind string, data []byte) {
 	if len(data) == 0 || r.truncated {
 		return
 	}
+	// Per-direction wire byte counts (hub protocol §3.4.8). Updated even
+	// when the events array hits its cap and stops growing — the counts
+	// reflect what actually crossed the socket, not what we managed to
+	// keep in the transcript.
+	now := time.Now()
+	switch kind {
+	case "i":
+		r.bytesIn += uint64(len(data))
+		r.lastInputAt = now
+	case "o":
+		r.bytesOut += uint64(len(data))
+		if !r.lastInputAt.IsZero() {
+			delta := now.Sub(r.lastInputAt).Milliseconds()
+			if delta >= 0 && delta < 60_000 {
+				r.responseSumMS += uint64(delta)
+				r.responsePairs++
+			}
+			r.lastInputAt = time.Time{}
+		}
+	}
 	if len(r.events) >= maxEvents || r.total+uint64(len(data)) > maxEventBytes {
 		r.truncated = true
 		return
@@ -1822,6 +1885,13 @@ func (r *recorder) add(kind string, data []byte) {
 	r.total += uint64(len(data))
 }
 
+func (r *recorder) responseMSAvg() uint64 {
+	if r.responsePairs == 0 {
+		return 0
+	}
+	return r.responseSumMS / r.responsePairs
+}
+
 func main() {
 	mrand.Seed(time.Now().UnixNano())
 	cfg := parseFlags()
@@ -1832,6 +1902,7 @@ func main() {
 		cfg:           cfg,
 		log:           l,
 		cooldownUntil: make(map[string]time.Time),
+		probeCounts:   make(map[string]uint64),
 		stats: stats{
 			StartedAt: processStarted,
 		},
@@ -2066,6 +2137,7 @@ func (s *appState) handleTelnetConn(c net.Conn) {
 	source := fmt.Sprintf("%s:%d", tcpAddr.IP.String(), tcpAddr.Port)
 	if until, cooling := s.isInCooldown(tcpAddr.IP.String(), start); cooling {
 		atomic.AddUint64(&s.stats.RejectedCooldown, 1)
+		s.bumpProbeCount(tcpAddr.IP.String())
 		s.log.Info("telnet connection from %s closed immediately by IP cooldown until %s", source, until.Format(time.RFC3339))
 		return
 	}
@@ -2347,6 +2419,7 @@ func (s *appState) handleSSHConn(c net.Conn, signer ssh.Signer) {
 	source := fmt.Sprintf("%s:%d", tcpAddr.IP.String(), tcpAddr.Port)
 	if until, cooling := s.isInCooldown(tcpAddr.IP.String(), start); cooling {
 		atomic.AddUint64(&s.stats.RejectedCooldown, 1)
+		s.bumpProbeCount(tcpAddr.IP.String())
 		s.log.Info("ssh connection from %s closed immediately by IP cooldown until %s", source, until.Format(time.RFC3339))
 		return
 	}
@@ -2399,7 +2472,11 @@ func (s *appState) handleSSHConn(c net.Conn, signer ssh.Signer) {
 		return
 	}
 	defer sshConn.Close()
-	s.log.Info("ssh session opened from %s as %s", source, sshConn.User())
+	clientBanner := string(sshConn.ClientVersion())
+	if len(clientBanner) > 200 {
+		clientBanner = clientBanner[:200]
+	}
+	s.log.Info("ssh session opened from %s as %s (%s)", source, sshConn.User(), clientBanner)
 	go ssh.DiscardRequests(reqs)
 
 	for ch := range chans {
@@ -2412,7 +2489,7 @@ func (s *appState) handleSSHConn(c net.Conn, signer ssh.Signer) {
 			s.log.Warn("ssh channel from %s failed: %v", source, err)
 			continue
 		}
-		s.handleSSHSession(c, channel, requests, start, source, tcpAddr, &authMu, &auth)
+		s.handleSSHSession(c, channel, requests, start, source, tcpAddr, &authMu, &auth, clientBanner)
 		return
 	}
 
@@ -2422,7 +2499,7 @@ func (s *appState) handleSSHConn(c net.Conn, signer ssh.Signer) {
 		capturedAuth.SSHPubkeys = append([]SSHKey(nil), auth.SSHPubkeys...)
 	}
 	authMu.Unlock()
-	s.finishSession(start, source, tcpAddr, "ssh", s.cfg.sshTargetPort, &recorder{}, capturedAuth, nil, io.EOF)
+	s.finishSession(start, source, tcpAddr, "ssh", s.cfg.sshTargetPort, &recorder{clientBanner: clientBanner}, capturedAuth, nil, io.EOF)
 }
 
 func authorizedKeyBody(key ssh.PublicKey) string {
@@ -2444,9 +2521,9 @@ func isBenignNetClose(err error) bool {
 		strings.Contains(text, "broken pipe")
 }
 
-func (s *appState) handleSSHSession(conn net.Conn, channel ssh.Channel, requests <-chan *ssh.Request, start time.Time, source string, tcpAddr *net.TCPAddr, authMu *sync.Mutex, auth *Auth) {
+func (s *appState) handleSSHSession(conn net.Conn, channel ssh.Channel, requests <-chan *ssh.Request, start time.Time, source string, tcpAddr *net.TCPAddr, authMu *sync.Mutex, auth *Auth, clientBanner string) {
 	defer channel.Close()
-	rec := &recorder{}
+	rec := &recorder{clientBanner: clientBanner}
 	execCh := make(chan string, 1)
 	shellCh := make(chan struct{}, 1)
 
@@ -2636,6 +2713,7 @@ func (s *appState) finishSession(start time.Time, source string, tcpAddr *net.TC
 	}
 
 	attackID := s.nextAttackID()
+	rec.connectCount = s.consumeProbeCount(tcpAddr.IP.String())
 	payload := s.buildPayload(attackID, start, tcpAddr, protocol, targetPort, rec, auth, commands)
 
 	status := "failed"
@@ -2698,6 +2776,24 @@ func (s *appState) markCooldown(ip string, now time.Time) {
 	s.cooldownUntil[ip] = until
 }
 
+// bumpProbeCount records a pre-session TCP connect from `ip` — used when an
+// accept is rejected by the cooldown window. Hub protocol §3.4 connect_count.
+func (s *appState) bumpProbeCount(ip string) {
+	s.cooldownMu.Lock()
+	defer s.cooldownMu.Unlock()
+	s.probeCounts[ip]++
+}
+
+// consumeProbeCount removes and returns the probe count accumulated for
+// `ip` while it was in cooldown. Called once per session at finalize.
+func (s *appState) consumeProbeCount(ip string) uint64 {
+	s.cooldownMu.Lock()
+	defer s.cooldownMu.Unlock()
+	n := s.probeCounts[ip]
+	delete(s.probeCounts, ip)
+	return n
+}
+
 func isIdleTimeout(err error) bool {
 	var netErr net.Error
 	return errors.As(err, &netErr) && netErr.Timeout()
@@ -2705,6 +2801,44 @@ func isIdleTimeout(err error) bool {
 
 func (s *appState) buildPayload(id uint64, start time.Time, tcpAddr *net.TCPAddr, protocol string, targetPort int, rec *recorder, auth Auth, commands []string) Payload {
 	profile, confidence := classify(commands, tcpAddr.IP)
+	commandSummary := strings.Join(commands, "\n")
+	cveRefs := extractCVEs(commandSummary)
+
+	attack := Attack{
+		ID:         id,
+		TS:         start.UTC().Format(time.RFC3339Nano),
+		DurationMS: uint64(math.Max(0, float64(time.Since(start).Milliseconds()))),
+		Protocol:   protocol,
+		Source:     Source{IP: tcpAddr.IP.String(), Port: tcpAddr.Port},
+		Target:     &Target{Port: targetPort},
+		Auth:       auth,
+		Session: &Session{
+			Commands:      len(commands),
+			Events:        rec.events,
+			CastTruncated: rec.truncated,
+			Term:          &Term{Cols: 80, Rows: 24},
+		},
+		Classification: &Classification{
+			Profile:        profile,
+			Confidence:     confidence,
+			CommandSummary: commandSummary,
+		},
+	}
+	if rec.bytesIn > 0 || rec.bytesOut > 0 {
+		attack.Bytes = &Bytes{RX: rec.bytesIn, TX: rec.bytesOut}
+	}
+	if rec.clientBanner != "" {
+		attack.Fingerprint = &Fingerprint{ClientBanner: rec.clientBanner}
+	}
+	if r := rec.responseMSAvg(); r > 0 {
+		attack.Timing = &Timing{ResponseMSAvg: r}
+	}
+	if rec.connectCount > 0 {
+		attack.ConnectCount = rec.connectCount
+	}
+	if len(cveRefs) > 0 {
+		attack.CVERefs = cveRefs
+	}
 	return Payload{
 		Schema: schemaVersion,
 		Honeypot: Honeypot{
@@ -2721,27 +2855,38 @@ func (s *appState) buildPayload(id uint64, start time.Time, tcpAddr *net.TCPAddr
 				CPUMHz:  s.cfg.cpuMHz,
 			},
 		},
-		Attack: Attack{
-			ID:         id,
-			TS:         start.UTC().Format(time.RFC3339Nano),
-			DurationMS: uint64(math.Max(0, float64(time.Since(start).Milliseconds()))),
-			Protocol:   protocol,
-			Source:     Source{IP: tcpAddr.IP.String(), Port: tcpAddr.Port},
-			Target:     &Target{Port: targetPort},
-			Auth:       auth,
-			Session: &Session{
-				Commands:      len(commands),
-				Events:        rec.events,
-				CastTruncated: rec.truncated,
-				Term:          &Term{Cols: 80, Rows: 24},
-			},
-			Classification: &Classification{
-				Profile:        profile,
-				Confidence:     confidence,
-				CommandSummary: strings.Join(commands, "\n"),
-			},
-		},
+		Attack: attack,
 	}
+}
+
+// CVE-ID extraction (hub protocol §3.4.11). One regex, deduped, capped.
+// Mirrors the hub-side extractor — the hub takes the union of firmware-
+// supplied refs and its own command_summary scan, so duplicates here
+// cost nothing.
+var cveRE = regexp.MustCompile(`\bCVE-(\d{4})-(\d{4,7})\b`)
+
+func extractCVEs(text string) []string {
+	if text == "" {
+		return nil
+	}
+	matches := cveRE.FindAllStringSubmatch(text, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(matches))
+	out := make([]string, 0, len(matches))
+	for _, m := range matches {
+		id := fmt.Sprintf("CVE-%s-%s", m[1], m[2])
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+		if len(out) >= 16 {
+			break
+		}
+	}
+	return out
 }
 
 func classify(commands []string, ip net.IP) (string, int) {
