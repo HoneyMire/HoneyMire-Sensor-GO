@@ -24,6 +24,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -58,10 +59,18 @@ const (
 
 const (
 	telnetLineMaxBytes = 4096
-	sshLineMaxBytes    = 256
+	sshLineMaxBytes    = 4096
 	sshExecMaxBytes    = 4096
 	sshMaxPubkeys      = 8
 	sshMaxPubkeyBytes  = 4 * 1024
+)
+
+const (
+	maxShellExpandedBytes    = 16 * 1024
+	maxCommandSubOutputBytes = 4 * 1024
+	maxFakeFiles             = 128
+	maxFakeFileBytes         = 64 * 1024
+	maxFakeFSBytes           = 256 * 1024
 )
 
 var processStarted = time.Now()
@@ -312,8 +321,14 @@ type fakeShell struct {
 	exit     bool
 	lastOK   bool
 	busybox  bool
-	files    map[string]string
+	files    map[string]fakeFile
 	lastName string
+}
+
+type fakeFile struct {
+	content string
+	mode    string
+	mtime   time.Time
 }
 
 func newFakeShell(user string, persona personaProfile) *fakeShell {
@@ -330,7 +345,7 @@ func newFakeShell(user string, persona personaProfile) *fakeShell {
 		cwd:     cwd,
 		persona: persona,
 		lastOK:  true,
-		files:   make(map[string]string),
+		files:   make(map[string]fakeFile),
 	}
 }
 
@@ -388,10 +403,7 @@ func (sh *fakeShell) prompt() string {
 }
 
 func (sh *fakeShell) displayCwd() string {
-	home := "/root"
-	if sh.user != "root" && sh.user != "admin" {
-		home = "/home/" + sh.user
-	}
+	home := sh.homeDir()
 	if sh.cwd == home {
 		return "~"
 	}
@@ -399,6 +411,98 @@ func (sh *fakeShell) displayCwd() string {
 		return "~" + strings.TrimPrefix(sh.cwd, home)
 	}
 	return sh.cwd
+}
+
+func (sh *fakeShell) homeDir() string {
+	if sh.user != "root" && sh.user != "admin" {
+		return "/home/" + sh.user
+	}
+	return "/root"
+}
+
+func (sh *fakeShell) pathEnv() string {
+	switch sh.persona.name {
+	case personaBusyBox, personaOpenWrt, personaHiLinux:
+		return "/bin:/sbin:/usr/bin:/usr/sbin"
+	default:
+		return "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+	}
+}
+
+func (sh *fakeShell) resolvePath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return sh.cwd
+	}
+	if path == "~" {
+		return sh.homeDir()
+	}
+	if strings.HasPrefix(path, "~/") {
+		path = sh.homeDir() + strings.TrimPrefix(path, "~")
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = strings.TrimRight(sh.cwd, "/") + "/" + path
+	}
+	return "/" + strings.Join(cleanPathParts(path), "/")
+}
+
+func (sh *fakeShell) expandArgs(argv []string) []string {
+	out := make([]string, 0, len(argv))
+	for i, arg := range argv {
+		if i == 0 || !strings.ContainsAny(arg, "*?") {
+			out = append(out, arg)
+			continue
+		}
+		matches := sh.glob(arg)
+		if len(matches) == 0 {
+			out = append(out, arg)
+		} else {
+			out = append(out, matches...)
+		}
+	}
+	return out
+}
+
+func (sh *fakeShell) glob(pattern string) []string {
+	prefix := ""
+	dir := sh.cwd
+	base := pattern
+	if strings.Contains(pattern, "/") {
+		resolved := sh.resolvePath(pattern)
+		dir = pathDir(resolved)
+		base = pathBase(resolved)
+		prefix = dir + "/"
+	}
+	names := sh.dirEntries(dir)
+	var out []string
+	for _, name := range names {
+		ok, _ := filepath.Match(base, name)
+		if ok {
+			if prefix == "" {
+				out = append(out, name)
+			} else {
+				out = append(out, prefix+name)
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func pathDir(path string) string {
+	idx := strings.LastIndex(path, "/")
+	if idx <= 0 {
+		return "/"
+	}
+	return path[:idx]
+}
+
+func pathBase(path string) string {
+	idx := strings.LastIndex(path, "/")
+	if idx < 0 {
+		return path
+	}
+	return path[idx+1:]
 }
 
 func (sh *fakeShell) execute(line string) string {
@@ -410,6 +514,7 @@ func (sh *fakeShell) execute(line string) string {
 	if len(sh.history) > 256 {
 		sh.history = sh.history[len(sh.history)-256:]
 	}
+	line = sh.expandShellLine(line, 3)
 	out := sh.runChain(line)
 	return normalizeCRLF(out)
 }
@@ -419,7 +524,8 @@ func (sh *fakeShell) runChain(raw string) string {
 	var out strings.Builder
 	prevOK := true
 	prevSep := ""
-	for _, part := range parts {
+	for i := 0; i < len(parts); i++ {
+		part := parts[i]
 		if part.cmd == "" {
 			prevSep = part.sep
 			continue
@@ -431,8 +537,14 @@ func (sh *fakeShell) runChain(raw string) string {
 		if prevSep == "||" && prevOK {
 			run = false
 		}
+		pipeline := []chainPart{part}
+		for part.sep == "|" && i+1 < len(parts) {
+			i++
+			part = parts[i]
+			pipeline = append(pipeline, part)
+		}
 		if run {
-			out.WriteString(sh.runOne(parseCommand(part.cmd)))
+			out.WriteString(sh.runPipeline(pipeline))
 			prevOK = sh.lastOK
 		}
 		prevSep = part.sep
@@ -441,6 +553,19 @@ func (sh *fakeShell) runChain(raw string) string {
 		}
 	}
 	return out.String()
+}
+
+func (sh *fakeShell) runPipeline(parts []chainPart) string {
+	input := ""
+	output := ""
+	for _, part := range parts {
+		if part.cmd == "" {
+			continue
+		}
+		output = sh.runOneInput(parseCommand(part.cmd), input)
+		input = truncateBytes(output, maxShellExpandedBytes)
+	}
+	return output
 }
 
 type chainPart struct {
@@ -487,18 +612,152 @@ func splitCommandChain(raw string) []chainPart {
 }
 
 type parsedCommand struct {
-	raw  string
-	exe  string
-	argv []string
+	raw          string
+	exe          string
+	argv         []string
+	stdoutPath   string
+	stdoutAppend bool
 }
 
 func parseCommand(raw string) parsedCommand {
 	argv := shellFields(raw)
 	cmd := parsedCommand{raw: raw, argv: argv}
-	if len(argv) > 0 {
-		cmd.exe = normalizeExe(argv[0])
+	cmd.argv, cmd.stdoutPath, cmd.stdoutAppend = extractShellControlArgs(argv)
+	if len(cmd.argv) > 0 {
+		cmd.exe = normalizeExe(cmd.argv[0])
 	}
 	return cmd
+}
+
+func (sh *fakeShell) expandShellLine(line string, depth int) string {
+	if depth <= 0 {
+		return truncateBytes(line, maxShellExpandedBytes)
+	}
+	line = sh.expandCommandSubstitutions(line, "$(", ")", depth)
+	line = sh.expandBackticks(line, depth)
+	return truncateBytes(sh.expandVars(line), maxShellExpandedBytes)
+}
+
+func (sh *fakeShell) expandCommandSubstitutions(line, open, close string, depth int) string {
+	for {
+		start := strings.Index(line, open)
+		if start < 0 {
+			return line
+		}
+		i := start + len(open)
+		nested := 1
+		for i < len(line) {
+			if strings.HasPrefix(line[i:], open) {
+				nested++
+				i += len(open)
+				continue
+			}
+			if strings.HasPrefix(line[i:], close) {
+				nested--
+				if nested == 0 {
+					break
+				}
+				i += len(close)
+				continue
+			}
+			i++
+		}
+		if i >= len(line) {
+			return line
+		}
+		cmd := line[start+len(open) : i]
+		out := sh.runChain(sh.expandShellLine(cmd, depth-1))
+		out = truncateBytes(out, maxCommandSubOutputBytes)
+		out = strings.Join(strings.Fields(out), " ")
+		line = line[:start] + out + line[i+len(close):]
+		line = truncateBytes(line, maxShellExpandedBytes)
+	}
+}
+
+func (sh *fakeShell) expandBackticks(line string, depth int) string {
+	for {
+		start := strings.IndexByte(line, '`')
+		if start < 0 {
+			return line
+		}
+		end := strings.IndexByte(line[start+1:], '`')
+		if end < 0 {
+			return line
+		}
+		end += start + 1
+		cmd := line[start+1 : end]
+		out := sh.runChain(sh.expandShellLine(cmd, depth-1))
+		out = truncateBytes(out, maxCommandSubOutputBytes)
+		out = strings.Join(strings.Fields(out), " ")
+		line = line[:start] + out + line[end+1:]
+		line = truncateBytes(line, maxShellExpandedBytes)
+	}
+}
+
+func (sh *fakeShell) expandVars(line string) string {
+	repl := map[string]string{
+		"$USER":    sh.user,
+		"$LOGNAME": sh.user,
+		"$HOME":    sh.homeDir(),
+		"$PWD":     sh.cwd,
+		"$SHELL":   "/bin/sh",
+		"$PATH":    sh.pathEnv(),
+	}
+	for k, v := range repl {
+		line = strings.ReplaceAll(line, k, v)
+	}
+	return line
+}
+
+func extractShellControlArgs(argv []string) ([]string, string, bool) {
+	out := make([]string, 0, len(argv))
+	stdoutPath := ""
+	stdoutAppend := false
+	for i := 0; i < len(argv); i++ {
+		arg := argv[i]
+		if arg == "&" {
+			break
+		}
+		if arg == ">" || arg == ">>" || arg == "1>" || arg == "1>>" {
+			stdoutAppend = strings.Contains(arg, ">>")
+			if i+1 < len(argv) {
+				stdoutPath = argv[i+1]
+				i++
+			}
+			continue
+		}
+		if strings.HasPrefix(arg, ">>") {
+			stdoutPath = strings.TrimPrefix(arg, ">>")
+			stdoutAppend = true
+			continue
+		}
+		if strings.HasPrefix(arg, ">") {
+			stdoutPath = strings.TrimPrefix(arg, ">")
+			stdoutAppend = false
+			continue
+		}
+		if strings.HasPrefix(arg, "1>>") {
+			stdoutPath = strings.TrimPrefix(arg, "1>>")
+			stdoutAppend = true
+			continue
+		}
+		if strings.HasPrefix(arg, "1>") {
+			stdoutPath = strings.TrimPrefix(arg, "1>")
+			stdoutAppend = false
+			continue
+		}
+		if arg == "<" || arg == "2>" || arg == "2>>" {
+			if i+1 < len(argv) {
+				i++
+			}
+			continue
+		}
+		if strings.HasPrefix(arg, "2>") {
+			continue
+		}
+		out = append(out, arg)
+	}
+	return out, stdoutPath, stdoutAppend
 }
 
 func shellFields(s string) []string {
@@ -541,6 +800,25 @@ func shellFields(s string) []string {
 
 func normalizeExe(s string) string {
 	s = strings.TrimSpace(s)
+	if strings.Contains(s, "/") {
+		parts := strings.Split(s, "/")
+		cleaned := parts[:0]
+		for _, part := range parts {
+			if part == "" || part == "." {
+				continue
+			}
+			if part == ".." {
+				if len(cleaned) > 0 {
+					cleaned = cleaned[:len(cleaned)-1]
+				}
+				continue
+			}
+			cleaned = append(cleaned, part)
+		}
+		if len(cleaned) > 0 {
+			s = cleaned[len(cleaned)-1]
+		}
+	}
 	if idx := strings.LastIndex(s, "/"); idx >= 0 {
 		s = s[idx+1:]
 	}
@@ -548,10 +826,15 @@ func normalizeExe(s string) string {
 }
 
 func (sh *fakeShell) runOne(c parsedCommand) string {
+	return sh.runOneInput(c, "")
+}
+
+func (sh *fakeShell) runOneInput(c parsedCommand, input string) string {
 	sh.lastOK = true
 	if len(c.argv) == 0 || c.exe == "" {
 		return ""
 	}
+	c.argv = sh.expandArgs(c.argv)
 	e := c.exe
 	sh.lastName = e
 	if e == "busybox" {
@@ -562,102 +845,154 @@ func (sh *fakeShell) runOne(c parsedCommand) string {
 		inner := parsedCommand{raw: strings.Join(c.argv[1:], " "), argv: c.argv[1:], exe: normalizeExe(c.argv[1])}
 		prev := sh.busybox
 		sh.busybox = true
-		out := sh.runOne(inner)
+		out := sh.runOneInput(inner, input)
 		sh.busybox = prev
 		if !sh.lastOK && out == sh.notFound(inner.exe) {
 			return applet + ": applet not found\n"
 		}
 		return out
 	}
-	if strings.HasPrefix(c.argv[0], "./") || strings.HasPrefix(c.argv[0], "/tmp/") || strings.HasPrefix(c.argv[0], "/var/tmp/") || strings.HasPrefix(c.argv[0], "/dev/shm/") {
+	if isUploadedExecutablePath(c.argv[0]) {
 		return ""
 	}
+	var output string
 	switch e {
 	case "exit", "logout", "quit":
 		sh.exit = true
-		return ""
-	case "enable", "shell", "system", "linuxshell", "unset", "alias", "unalias", "ulimit", "umask", "exec", "eval", "source", ".", "command", "builtin", "chmod", "chown", "chgrp", "rm", "mkdir", "rmdir", "touch", "mv", "cp", "dd", "sleep", "nohup", "setsid", "timeout":
-		return ""
+		output = ""
+	case "enable", "shell", "system", "linuxshell", "unset", "alias", "unalias", "ulimit", "umask", "exec", "eval", "source", ".", "command", "builtin", "chown", "chgrp", "dd", "sleep", "nohup", "setsid", "timeout":
+		output = ""
+	case "chmod":
+		output = sh.cmdChmod(c)
+	case "rm":
+		output = sh.cmdRm(c)
+	case "mkdir", "rmdir":
+		output = ""
+	case "touch":
+		output = sh.cmdTouch(c)
+	case "mv":
+		output = sh.cmdMv(c)
+	case "cp":
+		output = sh.cmdCp(c)
 	case "sh", "bash", "ash", "dash", "zsh":
-		return ""
+		output = ""
 	case "echo":
-		return strings.Join(c.argv[1:], " ") + "\n"
+		output = strings.Join(c.argv[1:], " ") + "\n"
 	case "printf":
 		if len(c.argv) > 1 {
-			return strings.ReplaceAll(c.argv[1], `\n`, "\n")
+			output = decodePrintfEscapes(c.argv[1])
+		} else {
+			output = ""
 		}
-		return ""
 	case "pwd":
-		return sh.cwd + "\n"
+		output = sh.cwd + "\n"
 	case "whoami":
-		return sh.user + "\n"
+		output = sh.user + "\n"
 	case "hostname":
-		return sh.host + "\n"
+		output = sh.host + "\n"
 	case "id":
 		if sh.user == "root" || sh.user == "admin" {
-			return "uid=0(root) gid=0(root) groups=0(root)\n"
+			output = "uid=0(root) gid=0(root) groups=0(root)\n"
+		} else {
+			output = "uid=1000(" + sh.user + ") gid=1000(" + sh.user + ") groups=1000(" + sh.user + ")\n"
 		}
-		return "uid=1000(" + sh.user + ") gid=1000(" + sh.user + ") groups=1000(" + sh.user + ")\n"
 	case "uname":
-		return sh.cmdUname(c)
+		output = sh.cmdUname(c)
 	case "cat":
-		return sh.cmdCat(c)
+		output = sh.cmdCat(c, input)
 	case "head", "tail":
-		return sh.cmdCat(c)
+		output = sh.cmdHeadTail(c, input)
+	case "grep", "egrep", "fgrep":
+		output = sh.cmdGrep(c, input)
+	case "wc":
+		output = sh.cmdWc(c, input)
+	case "sort":
+		output = sh.cmdSort(c, input)
+	case "uniq":
+		output = sh.cmdUniq(c, input)
+	case "cut":
+		output = sh.cmdCut(c, input)
 	case "ls", "dir":
-		return sh.cmdLs(c)
+		output = sh.cmdLs(c)
 	case "cd":
-		return sh.cmdCd(c)
+		output = sh.cmdCd(c)
 	case "ps":
-		return "  PID TTY          TIME CMD\n    1 ?        00:00:02 init\n  501 ?        00:00:00 sshd\n  999 pts/0    00:00:00 sh\n"
+		output = "  PID TTY          TIME CMD\n    1 ?        00:00:02 init\n  501 ?        00:00:00 sshd\n  999 pts/0    00:00:00 sh\n"
 	case "netstat":
-		return "Active Internet connections (servers and established)\nProto Recv-Q Send-Q Local Address           Foreign Address         State\ntcp        0      0 0.0.0.0:22              0.0.0.0:*               LISTEN\n"
+		output = "Active Internet connections (servers and established)\nProto Recv-Q Send-Q Local Address           Foreign Address         State\ntcp        0      0 0.0.0.0:22              0.0.0.0:*               LISTEN\n"
 	case "ss":
-		return "Netid State  Recv-Q Send-Q Local Address:Port Peer Address:Port\ntcp   LISTEN 0      128          0.0.0.0:ssh       0.0.0.0:*\n"
+		output = "Netid State  Recv-Q Send-Q Local Address:Port Peer Address:Port\ntcp   LISTEN 0      128          0.0.0.0:ssh       0.0.0.0:*\n"
 	case "ifconfig":
-		return "eth0      Link encap:Ethernet  HWaddr 02:42:ac:11:00:02\n          inet addr:10.0.0.42  Bcast:10.0.0.255  Mask:255.255.255.0\n"
+		output = "eth0      Link encap:Ethernet  HWaddr 02:42:ac:11:00:02\n          inet addr:10.0.0.42  Bcast:10.0.0.255  Mask:255.255.255.0\n"
 	case "ip":
-		return "2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500\n    inet 10.0.0.42/24 brd 10.0.0.255 scope global eth0\n"
+		output = "2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500\n    inet 10.0.0.42/24 brd 10.0.0.255 scope global eth0\n"
 	case "route":
-		return "Kernel IP routing table\nDestination     Gateway         Genmask         Flags Iface\ndefault         10.0.0.1        0.0.0.0         UG    eth0\n"
+		output = "Kernel IP routing table\nDestination     Gateway         Genmask         Flags Iface\ndefault         10.0.0.1        0.0.0.0         UG    eth0\n"
 	case "df":
-		return "Filesystem     1K-blocks    Used Available Use% Mounted on\n/dev/root       20511356 4801216  14645140  25% /\n"
+		output = "Filesystem     1K-blocks    Used Available Use% Mounted on\n/dev/root       20511356 4801216  14645140  25% /\n"
 	case "free":
-		return "              total        used        free      shared  buff/cache   available\nMem:         503316       142328       217088        1024       143900       324120\nSwap:             0            0            0\n"
+		output = "              total        used        free      shared  buff/cache   available\nMem:         503316       142328       217088        1024       143900       324120\nSwap:             0            0            0\n"
 	case "uptime":
-		return " 10:14:33 up 12 days,  3:07,  1 user,  load average: 0.08, 0.03, 0.01\n"
+		output = " 10:14:33 up 12 days,  3:07,  1 user,  load average: 0.08, 0.03, 0.01\n"
+	case "date":
+		output = time.Now().UTC().Format("Mon Jan _2 15:04:05 UTC 2006") + "\n"
+	case "arch":
+		output = "x86_64\n"
+	case "nproc":
+		output = "2\n"
+	case "getconf":
+		if len(c.argv) > 1 && c.argv[1] == "LONG_BIT" {
+			output = "64\n"
+		} else {
+			output = ""
+		}
+	case "lscpu":
+		output = "Architecture:        x86_64\nCPU(s):              2\nModel name:          Intel(R) Xeon(R) CPU E5-2676 v3 @ 2.40GHz\nByte Order:          Little Endian\n"
 	case "w", "who", "last":
-		return ""
+		output = ""
 	case "mount":
-		return "/dev/root on / type ext4 (rw,relatime)\nproc on /proc type proc (rw,nosuid,nodev,noexec,relatime)\n"
+		output = "/dev/root on / type ext4 (rw,relatime)\nproc on /proc type proc (rw,nosuid,nodev,noexec,relatime)\n"
 	case "env", "printenv":
-		return "HOME=" + sh.cwd + "\nUSER=" + sh.user + "\nSHELL=/bin/sh\nPATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n"
+		output = "HOME=" + sh.cwd + "\nUSER=" + sh.user + "\nSHELL=/bin/sh\nPATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n"
 	case "history":
 		var b strings.Builder
 		for i, h := range sh.history {
 			fmt.Fprintf(&b, "%5d  %s\n", i+1, h)
 		}
-		return b.String()
+		output = b.String()
 	case "wget", "curl", "tftp", "ftpget", "tftpget":
-		return ""
+		output = sh.cmdDownload(c)
+	case "ping":
+		output = "PING " + lastNonOption(c.argv[1:]) + " (10.0.0.1): 56 data bytes\n"
 	case "which", "whereis", "type":
 		if len(c.argv) > 1 {
-			return "/bin/" + normalizeExe(c.argv[1]) + "\n"
+			output = "/bin/" + normalizeExe(c.argv[1]) + "\n"
+		} else {
+			output = ""
 		}
-		return ""
 	case "top":
-		return "top - 10:14:33 up 12 days,  1 user,  load average: 0.08, 0.03, 0.01\nTasks:  98 total,   1 running,  97 sleeping\n"
+		output = "top - 10:14:33 up 12 days,  1 user,  load average: 0.08, 0.03, 0.01\nTasks:  98 total,   1 running,  97 sleeping\n"
 	case "clear":
-		return "\x1b[H\x1b[2J"
+		output = "\x1b[H\x1b[2J"
 	case ":", "true":
-		return ""
+		output = ""
 	case "false":
 		sh.lastOK = false
-		return ""
+		output = ""
 	default:
 		sh.lastOK = false
-		return sh.notFound(e)
+		output = sh.notFound(e)
 	}
+	if c.stdoutPath != "" {
+		path := sh.resolvePath(c.stdoutPath)
+		if c.stdoutAppend {
+			sh.appendFakeFile(path, output)
+		} else {
+			sh.putFakeFile(path, fakeFile{content: output, mode: "-rw-r--r--", mtime: time.Now()})
+		}
+		return ""
+	}
+	return output
 }
 
 func (sh *fakeShell) notFound(name string) string {
@@ -668,114 +1003,714 @@ func (sh *fakeShell) notFound(name string) string {
 }
 
 func (sh *fakeShell) cmdUname(c parsedCommand) string {
-	all := len(c.argv) == 1
-	for _, a := range c.argv[1:] {
-		switch a {
-		case "-a":
-			switch sh.persona.name {
-			case personaBusyBox, personaOpenWrt, personaHiLinux:
-				return "Linux " + sh.host + " 4.4.194 #1 Wed Dec 1 15:12:01 CST 2022 mips GNU/Linux\n"
-			default:
-				return "Linux " + sh.host + " 5.15.0-91-generic #101-Ubuntu SMP x86_64 GNU/Linux\n"
-			}
-		case "-m":
-			if sh.persona.name == personaBusyBox || sh.persona.name == personaOpenWrt || sh.persona.name == personaHiLinux {
-				return "mips\n"
-			}
-			return "x86_64\n"
-		case "-r":
-			if sh.persona.name == personaBusyBox || sh.persona.name == personaOpenWrt || sh.persona.name == personaHiLinux {
-				return "4.4.194\n"
-			}
-			return "5.15.0-91-generic\n"
-		case "-s":
-			return "Linux\n"
-		}
-	}
-	if all {
+	kernel := sh.kernelRelease()
+	version := sh.kernelVersion()
+	machine := sh.machine()
+	if len(c.argv) == 1 {
 		return "Linux\n"
 	}
-	return "Linux\n"
+	var fields []string
+	for _, a := range c.argv[1:] {
+		if a == "-a" {
+			return "Linux " + sh.host + " " + kernel + " " + version + " " + machine + " GNU/Linux\n"
+		}
+		if strings.HasPrefix(a, "-") && len(a) > 2 {
+			for _, r := range a[1:] {
+				switch r {
+				case 's':
+					fields = append(fields, "Linux")
+				case 'n':
+					fields = append(fields, sh.host)
+				case 'r':
+					fields = append(fields, kernel)
+				case 'v':
+					fields = append(fields, version)
+				case 'm':
+					fields = append(fields, machine)
+				case 'p', 'i':
+					fields = append(fields, "unknown")
+				case 'o':
+					fields = append(fields, "GNU/Linux")
+				}
+			}
+			continue
+		}
+		switch a {
+		case "-m":
+			fields = append(fields, machine)
+		case "-n":
+			fields = append(fields, sh.host)
+		case "-r":
+			fields = append(fields, kernel)
+		case "-s":
+			fields = append(fields, "Linux")
+		case "-v":
+			fields = append(fields, version)
+		case "-p", "-i":
+			fields = append(fields, "unknown")
+		case "-o":
+			fields = append(fields, "GNU/Linux")
+		}
+	}
+	if len(fields) == 0 {
+		return "Linux\n"
+	}
+	return strings.Join(fields, " ") + "\n"
 }
 
-func (sh *fakeShell) cmdCat(c parsedCommand) string {
+func (sh *fakeShell) cmdCat(c parsedCommand, input string) string {
 	if len(c.argv) < 2 {
-		return ""
+		return input
 	}
 	var b strings.Builder
 	for _, p := range c.argv[1:] {
 		if strings.HasPrefix(p, "-") {
 			continue
 		}
-		b.WriteString(sh.fileContent(p))
+		b.WriteString(sh.fileContent(sh.resolvePath(p)))
 	}
 	return b.String()
 }
 
+func (sh *fakeShell) cmdHeadTail(c parsedCommand, input string) string {
+	n := 10
+	var files []string
+	for i := 1; i < len(c.argv); i++ {
+		arg := c.argv[i]
+		if arg == "-n" && i+1 < len(c.argv) {
+			if parsed, err := strconv.Atoi(c.argv[i+1]); err == nil && parsed > 0 {
+				n = parsed
+			}
+			i++
+			continue
+		}
+		if strings.HasPrefix(arg, "-n") && len(arg) > 2 {
+			if parsed, err := strconv.Atoi(strings.TrimPrefix(arg, "-n")); err == nil && parsed > 0 {
+				n = parsed
+			}
+			continue
+		}
+		if strings.HasPrefix(arg, "-") {
+			continue
+		}
+		files = append(files, arg)
+	}
+	text := input
+	if len(files) > 0 {
+		var b strings.Builder
+		for _, f := range files {
+			b.WriteString(sh.fileContent(sh.resolvePath(f)))
+		}
+		text = b.String()
+	}
+	lines := splitLines(text)
+	if len(lines) <= n {
+		return text
+	}
+	if c.exe == "tail" {
+		return strings.Join(lines[len(lines)-n:], "\n") + "\n"
+	}
+	return strings.Join(lines[:n], "\n") + "\n"
+}
+
+func (sh *fakeShell) cmdGrep(c parsedCommand, input string) string {
+	ignoreCase := false
+	invert := false
+	fixed := c.exe == "fgrep"
+	var pattern string
+	var files []string
+	for _, arg := range c.argv[1:] {
+		if strings.HasPrefix(arg, "-") && pattern == "" {
+			if strings.Contains(arg, "i") {
+				ignoreCase = true
+			}
+			if strings.Contains(arg, "v") {
+				invert = true
+			}
+			if strings.Contains(arg, "F") {
+				fixed = true
+			}
+			continue
+		}
+		if pattern == "" {
+			pattern = arg
+			continue
+		}
+		files = append(files, arg)
+	}
+	if pattern == "" {
+		sh.lastOK = false
+		return ""
+	}
+	text := input
+	if len(files) > 0 {
+		var b strings.Builder
+		for _, f := range files {
+			b.WriteString(sh.fileContent(sh.resolvePath(f)))
+		}
+		text = b.String()
+	}
+	cmpPattern := pattern
+	if ignoreCase {
+		cmpPattern = strings.ToLower(cmpPattern)
+	}
+	var out strings.Builder
+	matchedAny := false
+	for _, line := range splitLines(text) {
+		cmpLine := line
+		if ignoreCase {
+			cmpLine = strings.ToLower(cmpLine)
+		}
+		matched := false
+		if fixed || c.exe == "grep" || c.exe == "egrep" {
+			matched = strings.Contains(cmpLine, cmpPattern)
+		}
+		if invert {
+			matched = !matched
+		}
+		if matched {
+			matchedAny = true
+			out.WriteString(line)
+			out.WriteByte('\n')
+		}
+	}
+	sh.lastOK = matchedAny
+	return out.String()
+}
+
+func (sh *fakeShell) cmdWc(c parsedCommand, input string) string {
+	showLines, showWords, showBytes := false, false, false
+	var files []string
+	for _, arg := range c.argv[1:] {
+		if strings.HasPrefix(arg, "-") {
+			showLines = showLines || strings.Contains(arg, "l")
+			showWords = showWords || strings.Contains(arg, "w")
+			showBytes = showBytes || strings.Contains(arg, "c")
+			continue
+		}
+		files = append(files, arg)
+	}
+	if !showLines && !showWords && !showBytes {
+		showLines, showWords, showBytes = true, true, true
+	}
+	text := input
+	if len(files) > 0 {
+		var b strings.Builder
+		for _, f := range files {
+			b.WriteString(sh.fileContent(sh.resolvePath(f)))
+		}
+		text = b.String()
+	}
+	var fields []string
+	if showLines {
+		fields = append(fields, fmt.Sprintf("%8d", strings.Count(text, "\n")))
+	}
+	if showWords {
+		fields = append(fields, fmt.Sprintf("%8d", len(strings.Fields(text))))
+	}
+	if showBytes {
+		fields = append(fields, fmt.Sprintf("%8d", len([]byte(text))))
+	}
+	return strings.Join(fields, "") + "\n"
+}
+
+func (sh *fakeShell) cmdSort(_ parsedCommand, input string) string {
+	lines := splitLines(input)
+	sort.Strings(lines)
+	if len(lines) == 0 {
+		return ""
+	}
+	return strings.Join(lines, "\n") + "\n"
+}
+
+func (sh *fakeShell) cmdUniq(_ parsedCommand, input string) string {
+	lines := splitLines(input)
+	if len(lines) == 0 {
+		return ""
+	}
+	out := []string{lines[0]}
+	for _, line := range lines[1:] {
+		if line != out[len(out)-1] {
+			out = append(out, line)
+		}
+	}
+	return strings.Join(out, "\n") + "\n"
+}
+
+func (sh *fakeShell) cmdCut(c parsedCommand, input string) string {
+	delimiter := "\t"
+	field := 1
+	for i := 1; i < len(c.argv); i++ {
+		arg := c.argv[i]
+		if arg == "-d" && i+1 < len(c.argv) {
+			delimiter = c.argv[i+1]
+			i++
+			continue
+		}
+		if strings.HasPrefix(arg, "-d") && len(arg) > 2 {
+			delimiter = strings.Trim(arg[2:], `"'`)
+			continue
+		}
+		if arg == "-f" && i+1 < len(c.argv) {
+			if parsed, err := strconv.Atoi(c.argv[i+1]); err == nil && parsed > 0 {
+				field = parsed
+			}
+			i++
+			continue
+		}
+		if strings.HasPrefix(arg, "-f") && len(arg) > 2 {
+			if parsed, err := strconv.Atoi(arg[2:]); err == nil && parsed > 0 {
+				field = parsed
+			}
+		}
+	}
+	var out strings.Builder
+	for _, line := range splitLines(input) {
+		parts := strings.Split(line, delimiter)
+		if field <= len(parts) {
+			out.WriteString(parts[field-1])
+		}
+		out.WriteByte('\n')
+	}
+	return out.String()
+}
+
+func (sh *fakeShell) cmdTouch(c parsedCommand) string {
+	for _, arg := range c.argv[1:] {
+		if strings.HasPrefix(arg, "-") {
+			continue
+		}
+		path := sh.resolvePath(arg)
+		f := sh.files[path]
+		if f.mode == "" {
+			f.mode = "-rw-r--r--"
+		}
+		f.mtime = time.Now()
+		sh.putFakeFile(path, f)
+	}
+	return ""
+}
+
+func (sh *fakeShell) cmdChmod(c parsedCommand) string {
+	if len(c.argv) < 3 {
+		return ""
+	}
+	mode := c.argv[1]
+	for _, arg := range c.argv[2:] {
+		path := sh.resolvePath(arg)
+		f := sh.files[path]
+		if f.mode == "" {
+			f.mode = "-rw-r--r--"
+		}
+		if strings.Contains(mode, "+x") {
+			f.mode = executableMode(f.mode)
+		}
+		if mode == "777" || mode == "0777" {
+			f.mode = "-rwxrwxrwx"
+		}
+		f.mtime = time.Now()
+		sh.putFakeFile(path, f)
+	}
+	return ""
+}
+
+func executableMode(mode string) string {
+	if len(mode) != 10 {
+		return "-rwxr-xr-x"
+	}
+	b := []byte(mode)
+	for _, i := range []int{3, 6, 9} {
+		if b[i] == '-' {
+			b[i] = 'x'
+		}
+	}
+	return string(b)
+}
+
+func (sh *fakeShell) cmdRm(c parsedCommand) string {
+	for _, arg := range c.argv[1:] {
+		if strings.HasPrefix(arg, "-") {
+			continue
+		}
+		delete(sh.files, sh.resolvePath(arg))
+	}
+	return ""
+}
+
+func (sh *fakeShell) cmdCp(c parsedCommand) string {
+	if len(c.argv) < 3 {
+		return ""
+	}
+	src := sh.resolvePath(c.argv[len(c.argv)-2])
+	dst := sh.resolvePath(c.argv[len(c.argv)-1])
+	if f, ok := sh.files[src]; ok {
+		f.mtime = time.Now()
+		sh.putFakeFile(dst, f)
+		return ""
+	}
+	content := sh.fileContent(src)
+	if sh.lastOK {
+		sh.putFakeFile(dst, fakeFile{content: content, mode: "-rw-r--r--", mtime: time.Now()})
+	}
+	return ""
+}
+
+func (sh *fakeShell) cmdMv(c parsedCommand) string {
+	if len(c.argv) < 3 {
+		return ""
+	}
+	src := sh.resolvePath(c.argv[len(c.argv)-2])
+	dst := sh.resolvePath(c.argv[len(c.argv)-1])
+	if f, ok := sh.files[src]; ok {
+		f.mtime = time.Now()
+		if sh.putFakeFile(dst, f) {
+			delete(sh.files, src)
+		}
+	}
+	return ""
+}
+
+func (sh *fakeShell) cmdDownload(c parsedCommand) string {
+	target := ""
+	urlValue := ""
+	for i := 1; i < len(c.argv); i++ {
+		arg := c.argv[i]
+		switch arg {
+		case "-O", "-o":
+			if i+1 < len(c.argv) {
+				target = c.argv[i+1]
+				i++
+			}
+			continue
+		case "-P":
+			if i+1 < len(c.argv) {
+				target = strings.TrimRight(c.argv[i+1], "/") + "/"
+				i++
+			}
+			continue
+		}
+		if strings.HasPrefix(arg, "-") {
+			continue
+		}
+		if strings.Contains(arg, "://") || strings.Contains(arg, ".") {
+			urlValue = arg
+		}
+	}
+	if target == "" {
+		name := "index.html"
+		if urlValue != "" {
+			u := urlValue
+			if idx := strings.LastIndex(u, "/"); idx >= 0 && idx+1 < len(u) {
+				name = u[idx+1:]
+			}
+			if q := strings.IndexAny(name, "?#"); q >= 0 {
+				name = name[:q]
+			}
+			if name == "" {
+				name = "index.html"
+			}
+		}
+		target = name
+	} else if strings.HasSuffix(target, "/") {
+		target += "index.html"
+	}
+	path := sh.resolvePath(target)
+	body := "#!/bin/sh\n# downloaded payload placeholder\nuname -a\n"
+	sh.putFakeFile(path, fakeFile{content: body, mode: "-rw-r--r--", mtime: time.Now()})
+	return ""
+}
+
+func (sh *fakeShell) putFakeFile(path string, f fakeFile) bool {
+	path = sh.resolvePath(path)
+	if _, ok := sh.files[path]; !ok && len(sh.files) >= maxFakeFiles {
+		return false
+	}
+	if f.mode == "" {
+		f.mode = "-rw-r--r--"
+	}
+	if f.mtime.IsZero() {
+		f.mtime = time.Now()
+	}
+	f.content = truncateBytes(f.content, maxFakeFileBytes)
+	used := sh.fakeFSBytes()
+	if old, ok := sh.files[path]; ok {
+		used -= len([]byte(old.content))
+	}
+	remaining := maxFakeFSBytes - used
+	if remaining < 0 {
+		remaining = 0
+	}
+	f.content = truncateBytes(f.content, remaining)
+	sh.files[path] = f
+	return true
+}
+
+func (sh *fakeShell) appendFakeFile(path, content string) bool {
+	path = sh.resolvePath(path)
+	prev := sh.files[path]
+	prev.content += content
+	prev.mode = firstNonEmpty(prev.mode, "-rw-r--r--")
+	prev.mtime = time.Now()
+	return sh.putFakeFile(path, prev)
+}
+
+func (sh *fakeShell) fakeFSBytes() int {
+	total := 0
+	for _, f := range sh.files {
+		total += len([]byte(f.content))
+	}
+	return total
+}
+
+func splitLines(text string) []string {
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = strings.TrimSuffix(text, "\n")
+	if text == "" {
+		return nil
+	}
+	return strings.Split(text, "\n")
+}
+
 func (sh *fakeShell) fileContent(path string) string {
+	path = sh.resolvePath(path)
 	switch path {
 	case "/etc/passwd":
-		if sh.persona.name == personaUbuntu {
-			return "root:x:0:0:root:/root:/bin/bash\n" +
-				"daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n" +
-				"www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin\n" +
-				"sshd:x:110:65534::/run/sshd:/usr/sbin/nologin\n" +
-				"ubuntu:x:1000:1000:Ubuntu:/home/ubuntu:/bin/bash\n"
-		}
-		return "root:x:0:0:root:/root:/bin/sh\nadmin:x:1000:1000:admin:/home/admin:/bin/sh\n"
+		return sh.passwdContent()
 	case "/etc/shadow":
 		return "root:*:19000:0:99999:7:::\n"
 	case "/etc/os-release":
-		if sh.persona.name == personaOpenWrt {
-			return "NAME=\"OpenWrt\"\nVERSION=\"14.07, Barrier Breaker\"\nID=openwrt\n"
-		}
-		if sh.persona.name == personaUbuntu {
-			return "PRETTY_NAME=\"Ubuntu 22.04.1 LTS\"\nNAME=\"Ubuntu\"\nVERSION_ID=\"22.04\"\n"
-		}
-		return ""
+		return sh.osReleaseContent()
 	case "/proc/cpuinfo":
-		return "processor\t: 0\nmodel name\t: ARMv7 Processor rev 5\nBogoMIPS\t: 38.40\n"
+		return sh.cpuinfoContent()
 	case "/proc/meminfo":
-		return "MemTotal:         503316 kB\nMemFree:          217088 kB\nMemAvailable:     324120 kB\n"
+		return sh.meminfoContent()
 	case "/proc/mounts":
 		return "/dev/root / ext4 rw,relatime 0 0\nproc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n"
+	case "/proc/version":
+		return "Linux version " + sh.kernelRelease() + " (buildd@lgw01-amd64-059) (gcc (Ubuntu 11.4.0-1ubuntu1~22.04) 11.4.0) " + sh.kernelVersion() + "\n"
+	case "/etc/issue":
+		if sh.persona.name == personaUbuntu {
+			return "Ubuntu 22.04.1 LTS \\n \\l\n"
+		}
+		if sh.persona.name == personaOpenWrt {
+			return "OpenWrt Barrier Breaker \\n \\l\n"
+		}
+		return sh.persona.banner + "\n"
+	case "/etc/hosts":
+		return "127.0.0.1 localhost\n127.0.1.1 " + sh.host + "\n"
+	case "/etc/resolv.conf":
+		return "nameserver 8.8.8.8\nnameserver 1.1.1.1\n"
 	case "/proc/self/cmdline":
 		return "cat\x00/proc/self/cmdline\x00"
 	default:
 		if content, ok := sh.files[path]; ok {
-			return content
+			return content.content
 		}
 		sh.lastOK = false
 		return "cat: " + path + ": No such file or directory\n"
 	}
 }
 
+func (sh *fakeShell) passwdContent() string {
+	if sh.persona.name == personaUbuntu {
+		return "root:x:0:0:root:/root:/bin/bash\n" +
+			"daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n" +
+			"www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin\n" +
+			"sshd:x:110:65534::/run/sshd:/usr/sbin/nologin\n" +
+			"ubuntu:x:1000:1000:Ubuntu:/home/ubuntu:/bin/bash\n"
+	}
+	return "root:x:0:0:root:/root:/bin/sh\nadmin:x:1000:1000:admin:/home/admin:/bin/sh\n"
+}
+
+func (sh *fakeShell) osReleaseContent() string {
+	switch sh.persona.name {
+	case personaOpenWrt:
+		return "NAME=\"OpenWrt\"\nVERSION=\"14.07, Barrier Breaker\"\nID=openwrt\nPRETTY_NAME=\"OpenWrt Barrier Breaker 14.07\"\n"
+	case personaBusyBox, personaHiLinux:
+		return "NAME=Buildroot\nVERSION=2022.02\nID=buildroot\nPRETTY_NAME=\"Buildroot 2022.02\"\n"
+	case personaUbuntu:
+		return "PRETTY_NAME=\"Ubuntu 22.04.1 LTS\"\nNAME=\"Ubuntu\"\nVERSION_ID=\"22.04\"\nVERSION=\"22.04.1 LTS (Jammy Jellyfish)\"\nID=ubuntu\n"
+	default:
+		return "NAME=\"Linux\"\nID=linux\n"
+	}
+}
+
+func (sh *fakeShell) kernelRelease() string {
+	if sh.persona.name == personaBusyBox || sh.persona.name == personaOpenWrt || sh.persona.name == personaHiLinux {
+		return "4.4.194"
+	}
+	return "5.15.0-91-generic"
+}
+
+func (sh *fakeShell) kernelVersion() string {
+	if sh.persona.name == personaBusyBox || sh.persona.name == personaOpenWrt || sh.persona.name == personaHiLinux {
+		return "#1 Wed Dec 1 15:12:01 CST 2022"
+	}
+	return "#101-Ubuntu SMP Tue Nov 14 13:30:08 UTC 2023"
+}
+
+func (sh *fakeShell) machine() string {
+	if sh.persona.name == personaBusyBox || sh.persona.name == personaOpenWrt || sh.persona.name == personaHiLinux {
+		return "mips"
+	}
+	return "x86_64"
+}
+
+func (sh *fakeShell) cpuinfoContent() string {
+	if sh.machine() == "mips" {
+		return "system type\t\t: Atheros AR9330 rev 1\nmachine\t\t\t: TP-LINK TL-WR740N/ND v4\nprocessor\t\t: 0\ncpu model\t\t: MIPS 24Kc V7.4\nBogoMIPS\t\t: 265.42\n"
+	}
+	return "processor\t: 0\nvendor_id\t: GenuineIntel\nmodel name\t: Intel(R) Xeon(R) CPU E5-2676 v3 @ 2.40GHz\ncpu MHz\t\t: 2399.998\nprocessor\t: 1\nvendor_id\t: GenuineIntel\nmodel name\t: Intel(R) Xeon(R) CPU E5-2676 v3 @ 2.40GHz\ncpu MHz\t\t: 2399.998\n"
+}
+
+func (sh *fakeShell) meminfoContent() string {
+	if sh.machine() == "mips" {
+		return "MemTotal:          61840 kB\nMemFree:           18428 kB\nMemAvailable:      29412 kB\nBuffers:            3104 kB\nCached:            15852 kB\n"
+	}
+	return "MemTotal:        2048576 kB\nMemFree:          617088 kB\nMemAvailable:    1324120 kB\nBuffers:           73900 kB\nCached:           543900 kB\n"
+}
+
 func (sh *fakeShell) cmdLs(c parsedCommand) string {
 	dir := sh.cwd
+	long := false
+	all := false
 	if len(c.argv) > 1 && !strings.HasPrefix(c.argv[len(c.argv)-1], "-") {
-		dir = c.argv[len(c.argv)-1]
+		dir = sh.resolvePath(c.argv[len(c.argv)-1])
 	}
+	for _, arg := range c.argv[1:] {
+		if strings.HasPrefix(arg, "-") {
+			long = long || strings.Contains(arg, "l")
+			all = all || strings.Contains(arg, "a")
+		}
+	}
+	if f, ok := sh.files[dir]; ok {
+		name := pathBase(dir)
+		if !long {
+			return name + "\n"
+		}
+		mode := f.mode
+		if mode == "" {
+			mode = "-rw-r--r--"
+		}
+		mtime := f.mtime
+		if mtime.IsZero() {
+			mtime = time.Now().Add(-30 * 24 * time.Hour)
+		}
+		return fmt.Sprintf("%s 1 root root %8d %s %s\n", mode, len(f.content), mtime.Format("Jan _2 15:04"), name)
+	}
+	entries := sh.dirEntries(dir)
+	if !all {
+		filtered := entries[:0]
+		for _, e := range entries {
+			if !strings.HasPrefix(e, ".") {
+				filtered = append(filtered, e)
+			}
+		}
+		entries = filtered
+	}
+	if len(entries) == 0 {
+		return ""
+	}
+	if !long {
+		return strings.Join(entries, "  ") + "\n"
+	}
+	var b strings.Builder
+	for _, name := range entries {
+		path := strings.TrimRight(dir, "/") + "/" + name
+		if dir == "/" {
+			path = "/" + name
+		}
+		mode := "drwxr-xr-x"
+		size := 4096
+		mtime := time.Now().Add(-30 * 24 * time.Hour)
+		if f, ok := sh.files[path]; ok {
+			mode = f.mode
+			if mode == "" {
+				mode = "-rw-r--r--"
+			}
+			size = len(f.content)
+			if !f.mtime.IsZero() {
+				mtime = f.mtime
+			}
+		} else if !sh.isDir(path) {
+			mode = "-rw-r--r--"
+			size = len(sh.fileContent(path))
+		}
+		fmt.Fprintf(&b, "%s 1 root root %8d %s %s\n", mode, size, mtime.Format("Jan _2 15:04"), name)
+	}
+	return b.String()
+}
+
+func (sh *fakeShell) dirEntries(dir string) []string {
+	dir = sh.resolvePath(dir)
+	entries := map[string]bool{}
 	switch dir {
-	case "/", "/root", "~":
-		return "bin  dev  etc  home  proc  root  tmp  usr  var\n"
-	case "/tmp", "/var/tmp":
-		return ""
+	case "/":
+		for _, e := range []string{"bin", "dev", "etc", "home", "proc", "root", "tmp", "usr", "var"} {
+			entries[e] = true
+		}
+	case "/root", sh.homeDir():
+		for _, e := range []string{".profile", ".ssh"} {
+			entries[e] = true
+		}
+	case "/tmp", "/var/tmp", "/dev/shm":
 	case "/etc":
-		return "passwd  shadow  hosts  resolv.conf  os-release  init.d\n"
-	default:
-		return ""
+		for _, e := range []string{"passwd", "shadow", "hosts", "resolv.conf", "os-release", "issue", "init.d"} {
+			entries[e] = true
+		}
+	case "/proc":
+		for _, e := range []string{"cpuinfo", "meminfo", "mounts", "version", "self"} {
+			entries[e] = true
+		}
+	case "/bin", "/usr/bin":
+		for _, e := range []string{"sh", "busybox", "cat", "grep", "uname", "wget", "curl", "chmod", "ls"} {
+			entries[e] = true
+		}
 	}
+	prefix := strings.TrimRight(dir, "/") + "/"
+	if dir == "/" {
+		prefix = "/"
+	}
+	for path := range sh.files {
+		if strings.HasPrefix(path, prefix) {
+			rest := strings.TrimPrefix(path, prefix)
+			if rest != "" && !strings.Contains(rest, "/") {
+				entries[rest] = true
+			}
+		}
+	}
+	out := make([]string, 0, len(entries))
+	for e := range entries {
+		out = append(out, e)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (sh *fakeShell) isDir(path string) bool {
+	path = sh.resolvePath(path)
+	switch path {
+	case "/", "/bin", "/dev", "/etc", "/home", "/proc", "/root", "/tmp", "/usr", "/usr/bin", "/var", "/var/tmp", "/dev/shm":
+		return true
+	}
+	prefix := strings.TrimRight(path, "/") + "/"
+	for p := range sh.files {
+		if strings.HasPrefix(p, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func (sh *fakeShell) cmdCd(c parsedCommand) string {
 	if len(c.argv) < 2 || c.argv[1] == "~" {
-		sh.cwd = "/root"
+		sh.cwd = sh.homeDir()
 		return ""
 	}
 	if strings.HasPrefix(c.argv[1], "/") {
-		sh.cwd = c.argv[1]
+		sh.cwd = sh.resolvePath(c.argv[1])
 	} else {
-		sh.cwd = strings.TrimRight(sh.cwd, "/") + "/" + c.argv[1]
+		sh.cwd = sh.resolvePath(c.argv[1])
 	}
 	return ""
 }
@@ -791,6 +1726,78 @@ func normalizeCRLF(s string) string {
 		prev = r
 	}
 	return b.String()
+}
+
+func decodePrintfEscapes(s string) string {
+	replacer := strings.NewReplacer(
+		`\\`, `\`,
+		`\n`, "\n",
+		`\r`, "\r",
+		`\t`, "\t",
+	)
+	return replacer.Replace(s)
+}
+
+func truncateBytes(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	if len([]byte(s)) <= max {
+		return s
+	}
+	b := []byte(s)
+	return string(b[:max])
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func lastNonOption(args []string) string {
+	for i := len(args) - 1; i >= 0; i-- {
+		if args[i] != "" && !strings.HasPrefix(args[i], "-") {
+			return args[i]
+		}
+	}
+	return "127.0.0.1"
+}
+
+func isUploadedExecutablePath(path string) bool {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return false
+	}
+	clean := path
+	if strings.HasPrefix(path, "/") {
+		clean = "/" + strings.Join(cleanPathParts(path), "/")
+	}
+	return strings.HasPrefix(clean, "./") ||
+		strings.HasPrefix(clean, "/tmp/") ||
+		strings.HasPrefix(clean, "/var/tmp/") ||
+		strings.HasPrefix(clean, "/dev/shm/")
+}
+
+func cleanPathParts(path string) []string {
+	parts := strings.Split(path, "/")
+	cleaned := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part == "" || part == "." {
+			continue
+		}
+		if part == ".." {
+			if len(cleaned) > 0 {
+				cleaned = cleaned[:len(cleaned)-1]
+			}
+			continue
+		}
+		cleaned = append(cleaned, part)
+	}
+	return cleaned
 }
 
 func (r *recorder) add(kind string, data []byte) {
@@ -1604,7 +2611,7 @@ func (s *appState) finishSSHExec(channel ssh.Channel, start time.Time, source st
 	shell := newFakeShell(auth.User, ubuntuPersona())
 	if cmd != "" {
 		commands = append(commands, cmd)
-		rec.add("i", []byte(cmd+"\n"))
+		rec.add("i", []byte(cmd+"\r\n"))
 	}
 	output := shell.execute(cmd)
 	if output != "" {

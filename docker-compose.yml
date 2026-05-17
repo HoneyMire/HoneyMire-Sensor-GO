@@ -1,5 +1,6 @@
 services:
   honeypot:
+    image: honeymire-sensor-go:local
     build: .
     restart: unless-stopped
     environment:

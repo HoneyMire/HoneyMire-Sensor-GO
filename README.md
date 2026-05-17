@@ -63,6 +63,16 @@ The workflow also publishes branch, tag, and commit-SHA tags. Public GHCR
 packages are free according to GitHub Packages billing, and GitHub currently
 lists Container Registry storage and bandwidth as free.
 
+If `docker pull` returns `unauthorized`, the package is still private or has not
+been published yet. After the first successful workflow run, open the package on
+GitHub, go to **Package settings**, and change its visibility to **Public**.
+Private pulls require a GitHub token with `read:packages`:
+
+```sh
+echo "$GITHUB_TOKEN" | docker login ghcr.io -u YOUR_GITHUB_USER --password-stdin
+docker pull ghcr.io/honeymire/honeymire-sensor-go:latest
+```
+
 ## Build Locally
 
 ```sh

